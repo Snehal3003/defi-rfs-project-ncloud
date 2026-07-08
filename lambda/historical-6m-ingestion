@@ -1,0 +1,617 @@
+import json
+import logging
+import urllib.request
+from datetime import datetime, timezone, timedelta
+
+import boto3
+
+
+# ==================================================
+# Logging
+# ==================================================
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+# ==================================================
+# AWS Clients
+# ==================================================
+
+s3 = boto3.client("s3")
+
+
+# ==================================================
+# Configuration
+# ==================================================
+
+PROCESSED_BUCKET = "rfs-processed-data"
+
+HISTORY_DAYS = 180
+
+
+# ==================================================
+# Protocol Configuration
+# ==================================================
+
+PROTOCOL_API = "https://api.llama.fi/protocol"
+
+PROTOCOL_SLUGS = [
+    "aave-v3",
+    "aave-v2",
+    "compound-v3",
+    "compound-finance",
+    "makerdao",
+    "sky",
+    "lido",
+    "uniswap-v3"
+]
+
+
+# ==================================================
+# Stablecoin Configuration
+# ==================================================
+
+STABLECOIN_API = (
+    "https://stablecoins.llama.fi/stablecoins"
+)
+
+STABLECOIN_HISTORY_API = (
+    "https://stablecoins.llama.fi/"
+    "stablecoincharts/all"
+)
+
+TARGET_STABLECOINS = [
+    "USDT",
+    "USDC",
+    "DAI",
+    "USDE",
+    "FDUSD",
+    "PYUSD",
+    "TUSD",
+    "USDD",
+    "FRAX",
+    "USD0",
+    "USDS"
+]
+
+
+# ==================================================
+# Save JSON to S3
+# ==================================================
+
+def save_json(bucket, key, payload):
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload),
+        ContentType="application/json"
+    )
+
+
+# ==================================================
+# Fetch JSON from API
+# ==================================================
+
+def fetch_json(url):
+
+    logger.info(
+        f"Fetching API: {url}"
+    )
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent":
+                "rfs-historical-loader"
+        }
+    )
+
+    with urllib.request.urlopen(
+        req,
+        timeout=60
+    ) as response:
+
+        return json.loads(
+            response.read().decode()
+        )
+
+
+# ==================================================
+# Convert Value to Float
+# ==================================================
+
+def safe_float(value):
+
+    try:
+
+        if isinstance(value, dict):
+
+            value = value.get(
+                "peggedUSD",
+                0
+            )
+
+        return float(
+            value or 0
+        )
+
+    except Exception:
+
+        return 0.0
+
+
+# ==================================================
+# Protocol Historical Data
+# ==================================================
+
+def load_protocol_history():
+
+    logger.info(
+        "STARTING PROTOCOL HISTORY"
+    )
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    cutoff_date = (
+        now - timedelta(
+            days=HISTORY_DAYS
+        )
+    )
+
+    total_count = 0
+
+    for slug in PROTOCOL_SLUGS:
+
+        protocol_count = 0
+
+        try:
+
+            url = (
+                f"{PROTOCOL_API}/{slug}"
+            )
+
+            raw_data = fetch_json(url)
+
+            tvl_history = raw_data.get(
+                "tvl",
+                []
+            )
+
+            logger.info(
+                f"{slug}: "
+                f"{len(tvl_history)} "
+                f"total history rows received"
+            )
+
+            for row in tvl_history:
+
+                try:
+
+                    timestamp = row.get(
+                        "date"
+                    )
+
+                    if timestamp is None:
+                        continue
+
+                    dt = (
+                        datetime.fromtimestamp(
+                            int(timestamp),
+                            timezone.utc
+                        )
+                    )
+
+                    if dt < cutoff_date:
+                        continue
+
+                    tvl = safe_float(
+                        row.get(
+                            "totalLiquidityUSD",
+                            0
+                        )
+                    )
+
+                    payload = {
+
+                        "slug":
+                            slug,
+
+                        "date":
+                            dt.strftime(
+                                "%Y-%m-%d"
+                            ),
+
+                        "tvl":
+                            tvl
+                    }
+
+                    key = (
+                        f"protocols/"
+                        f"protocols_history/"
+                        f"slug={slug}/"
+                        f"date="
+                        f"{payload['date']}/"
+                        f"data.json"
+                    )
+
+                    save_json(
+                        PROCESSED_BUCKET,
+                        key,
+                        payload
+                    )
+
+                    total_count += 1
+
+                    protocol_count += 1
+
+                except Exception as e:
+
+                    logger.error(
+                        f"Protocol row error "
+                        f"for {slug}: {e}"
+                    )
+
+            logger.info(
+                f"{slug}: "
+                f"{protocol_count} "
+                f"history rows saved"
+            )
+
+        except Exception as e:
+
+            logger.error(
+                f"Failed protocol "
+                f"{slug}: {e}"
+            )
+
+    logger.info(
+        f"TOTAL PROTOCOL HISTORY "
+        f"ROWS SAVED: {total_count}"
+    )
+
+    return total_count
+
+
+# ==================================================
+# Get Stablecoin Master List
+# ==================================================
+
+def get_stablecoin_master_list():
+
+    logger.info(
+        "FETCHING STABLECOIN MASTER LIST"
+    )
+
+    data = fetch_json(
+        STABLECOIN_API
+    )
+
+    stablecoins = data.get(
+        "peggedAssets",
+        []
+    )
+
+    logger.info(
+        f"Total stablecoins found: "
+        f"{len(stablecoins)}"
+    )
+
+    return stablecoins
+
+
+# ==================================================
+# Stablecoin Historical Data
+# ==================================================
+
+def load_stablecoin_history():
+
+    logger.info(
+        "STARTING STABLECOIN HISTORY"
+    )
+
+    total_count = 0
+
+    stablecoins = (
+        get_stablecoin_master_list()
+    )
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    cutoff_date = (
+        now - timedelta(
+            days=HISTORY_DAYS
+        )
+    )
+
+    target_symbols = {
+        symbol.upper()
+        for symbol
+        in TARGET_STABLECOINS
+    }
+
+    for stablecoin in stablecoins:
+
+        symbol = (
+            stablecoin.get(
+                "symbol"
+            )
+            or ""
+        )
+
+        normalized_symbol = (
+            symbol.upper()
+        )
+
+        if (
+            normalized_symbol
+            not in target_symbols
+        ):
+
+            continue
+
+        stablecoin_id = (
+            stablecoin.get(
+                "id"
+            )
+        )
+
+        if stablecoin_id is None:
+
+            logger.warning(
+                f"Skipping {symbol}: "
+                f"No stablecoin ID"
+            )
+
+            continue
+
+        stablecoin_count = 0
+
+        try:
+
+            history_url = (
+                f"{STABLECOIN_HISTORY_API}"
+                f"?stablecoin="
+                f"{stablecoin_id}"
+            )
+
+            history_rows = fetch_json(
+                history_url
+            )
+
+            if not isinstance(
+                history_rows,
+                list
+            ):
+
+                logger.warning(
+                    f"{symbol}: "
+                    f"Unexpected history "
+                    f"response type: "
+                    f"{type(history_rows)}"
+                )
+
+                continue
+
+            logger.info(
+                f"{symbol}: "
+                f"{len(history_rows)} "
+                f"total history rows "
+                f"received"
+            )
+
+            for row in history_rows:
+
+                try:
+
+                    timestamp = row.get(
+                        "date"
+                    )
+
+                    if timestamp is None:
+                        continue
+
+                    dt = (
+                        datetime.fromtimestamp(
+                            int(timestamp),
+                            timezone.utc
+                        )
+                    )
+
+                    if dt < cutoff_date:
+                        continue
+
+                    total_circulating = (
+                        row.get(
+                            "totalCirculating",
+                            {}
+                        )
+                    )
+
+                    circulating_supply = (
+                        safe_float(
+                            total_circulating
+                        )
+                    )
+
+                    payload = {
+
+                        "stablecoin_id":
+                            str(
+                                stablecoin_id
+                            ),
+
+                        "symbol":
+                            symbol,
+
+                        "date":
+                            dt.strftime(
+                                "%Y-%m-%d"
+                            ),
+
+                        "circulating_supply":
+                            circulating_supply
+                    }
+
+                    key = (
+                        f"stablecoins/"
+                        f"stablecoins_history/"
+                        f"symbol={symbol}/"
+                        f"date="
+                        f"{payload['date']}/"
+                        f"data.json"
+                    )
+
+                    save_json(
+                        PROCESSED_BUCKET,
+                        key,
+                        payload
+                    )
+
+                    total_count += 1
+
+                    stablecoin_count += 1
+
+                except Exception as e:
+
+                    logger.error(
+                        f"Stablecoin row "
+                        f"error for "
+                        f"{symbol}: {e}"
+                    )
+
+            logger.info(
+                f"{symbol}: "
+                f"{stablecoin_count} "
+                f"history rows saved"
+            )
+
+        except Exception as e:
+
+            logger.error(
+                f"Failed stablecoin "
+                f"{symbol}: {e}"
+            )
+
+    logger.info(
+        f"TOTAL STABLECOIN HISTORY "
+        f"ROWS SAVED: {total_count}"
+    )
+
+    return total_count
+
+
+# ==================================================
+# Lambda Handler
+# ==================================================
+
+def lambda_handler(event, context):
+
+    logger.info(
+        "================================"
+    )
+
+    logger.info(
+        "STARTING HISTORICAL DATA LOAD"
+    )
+
+    logger.info(
+        f"History window: "
+        f"{HISTORY_DAYS} days"
+    )
+
+    logger.info(
+        "================================"
+    )
+
+    protocol_rows = 0
+
+    stablecoin_rows = 0
+
+    protocol_error = None
+
+    stablecoin_error = None
+
+
+    # ==============================================
+    # Protocol History
+    # ==============================================
+
+    try:
+
+        protocol_rows = (
+            load_protocol_history()
+        )
+
+    except Exception as e:
+
+        protocol_error = str(e)
+
+        logger.exception(
+            "Protocol history failed"
+        )
+
+
+    # ==============================================
+    # Stablecoin History
+    # ==============================================
+
+    try:
+
+        stablecoin_rows = (
+            load_stablecoin_history()
+        )
+
+    except Exception as e:
+
+        stablecoin_error = str(e)
+
+        logger.exception(
+            "Stablecoin history failed"
+        )
+
+
+    # ==============================================
+    # Response
+    # ==============================================
+
+    response = {
+
+        "statusCode":
+            200,
+
+        "history_days":
+            HISTORY_DAYS,
+
+        "protocol_history_rows":
+            protocol_rows,
+
+        "stablecoin_history_rows":
+            stablecoin_rows
+    }
+
+    if protocol_error:
+
+        response[
+            "protocol_error"
+        ] = protocol_error
+
+    if stablecoin_error:
+
+        response[
+            "stablecoin_error"
+        ] = stablecoin_error
+
+
+    logger.info(
+        f"FINAL RESULT: "
+        f"{json.dumps(response)}"
+    )
+
+    return response
