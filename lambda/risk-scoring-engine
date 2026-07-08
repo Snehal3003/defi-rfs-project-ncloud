@@ -1,0 +1,586 @@
+import json
+import boto3
+from datetime import datetime, timezone
+
+s3 = boto3.client("s3")
+events = boto3.client("events")
+
+PROCESSED_BUCKET = "rfs-processed-data"
+
+
+def get_risk_state(score):
+
+    if score < 40:
+        return "High Risk"
+
+    elif score < 70:
+        return "Moderate"
+
+    else:
+        return "Low Risk"
+
+def send_kri_alert(
+    symbol,
+    depeg_pct
+):
+
+    try:
+
+        events.put_events(
+            Entries=[
+                {
+                    "EventBusName":
+                    "rfs-risk-events",
+
+                    "Source":
+                        "rfs.risk",
+
+                    "DetailType":
+                        "STABLECOIN_KRI_BREACH",
+
+                    "Detail":
+                        json.dumps({
+
+                            "symbol":
+                                symbol,
+
+                            "depeg_pct":
+                                depeg_pct
+
+                        })
+                }
+            ]
+        )
+
+    except Exception as e:
+
+        print(
+            f"Failed to publish KRI alert: {e}"
+        )
+
+def score_protocol(record):
+
+    # ======================================
+    # Governance (15%)
+    # ======================================
+
+    governance = 0
+
+    if record.get("parent_protocol"):
+        governance += 40
+
+    if record.get("parent_protocol_slug"):
+        governance += 30
+
+    if record.get("listed_at"):
+        governance += 30
+
+    governance = min(governance, 100)
+
+    # ======================================
+    # Liquidity (20%)
+    # ======================================
+
+    liquidity = 0
+
+    tvl = record.get(
+        "current_tvl",
+        0
+    )
+
+    if tvl > 1_000_000_000:
+        liquidity += 50
+
+    elif tvl > 100_000_000:
+        liquidity += 35
+
+    else:
+        liquidity += 20
+
+    liquidity += min(
+        record.get(
+            "chains_count",
+            0
+        ) * 2,
+        25
+    )
+
+    if record.get(
+        "change_1m",
+        0
+    ) > -10:
+
+        liquidity += 25
+
+    liquidity = min(liquidity, 100)
+
+    # ======================================
+    # Oracle (15%)
+    # ======================================
+
+    oracle_count = record.get(
+        "oracle_count",
+        0
+    )
+
+    if oracle_count >= 5:
+        oracle = 100
+
+    elif oracle_count >= 2:
+        oracle = 80
+
+    elif oracle_count >= 1:
+        oracle = 60
+
+    else:
+        oracle = 20
+
+    # ======================================
+    # Smart Contract (25%)
+    # ======================================
+
+    audit_count = record.get(
+        "audit_count",
+        0
+    )
+
+    if audit_count >= 3:
+        smart_contract = 100
+
+    elif audit_count >= 1:
+        smart_contract = 75
+
+    else:
+        smart_contract = 25
+
+    # ======================================
+    # Compliance (25%)
+    # ======================================
+
+    compliance = 0
+
+    if record.get("website"):
+        compliance += 50
+
+    if record.get("primary_chain"):
+        compliance += 50
+
+    compliance = min(
+        compliance,
+        100
+    )
+
+    # ======================================
+    # Reputation Modifier
+    # ======================================
+
+    reputation = 100
+
+    if record.get(
+        "hack_count",
+        0
+    ) > 0:
+
+        reputation -= 30
+
+    if record.get(
+        "wrong_liquidity",
+        False
+    ):
+
+        reputation -= 20
+
+    reputation = max(
+        reputation,
+        0
+    )
+
+    # ======================================
+    # Final Weighted Score
+    # ======================================
+
+    overall = round(
+
+        smart_contract * 0.25 +
+
+        liquidity * 0.20 +
+
+        oracle * 0.15 +
+
+        governance * 0.15 +
+
+        compliance * 0.25,
+
+        2
+    )
+
+    # Reputation Penalty
+
+    overall = round(
+
+        max(
+            0,
+            overall -
+            ((100 - reputation) * 0.20)
+        ),
+
+        2
+    )
+
+    return {
+
+        "smart_contract_score":
+            smart_contract,
+
+        "liquidity_score":
+            liquidity,
+
+        "oracle_score":
+            oracle,
+
+        "governance_score":
+            governance,
+
+        "compliance_score":
+            compliance,
+
+        "reputation_score":
+            reputation,
+
+        "overall_score":
+            overall,
+
+        "risk_state":
+            get_risk_state(
+                overall
+            ),
+
+        "kri_breach":
+            False
+    }
+def score_stablecoin(record):
+
+    governance = 50
+
+    if record.get(
+        "peg_mechanism"
+    ):
+        governance += 50
+
+    governance = min(
+        governance,
+        100
+    )
+
+    supply = record.get(
+        "circulating_supply",
+        0
+    )
+
+    if supply > 10_000_000_000:
+        liquidity = 100
+
+    elif supply > 1_000_000_000:
+        liquidity = 80
+
+    else:
+        liquidity = 50
+
+    oracle = 50
+
+    if record.get(
+        "price_source"
+    ):
+        oracle = 100
+
+    chain_count = record.get(
+        "chain_count",
+        0
+    )
+
+    if chain_count > 10:
+        smart_contract = 100
+
+    elif chain_count > 3:
+        smart_contract = 80
+
+    else:
+        smart_contract = 50
+
+    compliance = 50
+
+    if record.get(
+        "peg_type"
+    ):
+        compliance += 50
+
+    depeg = record.get(
+        "depeg_pct",
+        0
+    )
+
+    reputation = 100
+
+    kri_breach = False
+
+    if depeg > 1:
+        
+        reputation = 70
+        
+        kri_breach = True
+        
+        send_kri_alert(
+            record.get(
+            "symbol"
+            ),
+            depeg
+        )
+
+    overall = round(
+
+        smart_contract * 0.25 +
+
+        liquidity * 0.20 +
+
+        oracle * 0.15 +
+
+        governance * 0.15 +
+
+        compliance * 0.25,
+
+        2
+    )
+
+    overall = round(
+
+        max(
+            0,
+            overall -
+            ((100 - reputation) * 0.20)
+        ),
+
+        2
+    )
+
+    return {
+
+        "smart_contract_score":
+            smart_contract,
+
+        "liquidity_score":
+            liquidity,
+
+        "oracle_score":
+            oracle,
+
+        "governance_score":
+            governance,
+
+        "compliance_score":
+            compliance,
+
+        "reputation_score":
+            reputation,
+
+        "overall_score":
+            overall,
+
+        "risk_state":
+            get_risk_state(
+                overall
+            ),
+
+        "kri_breach":
+            kri_breach
+    }
+
+def get_protocol_files():
+
+    paginator = s3.get_paginator("list_objects_v2")
+
+    files = []
+
+    for page in paginator.paginate(
+        Bucket=PROCESSED_BUCKET,
+        Prefix="protocols/protocols_current/"
+    ):
+
+        for obj in page.get("Contents", []):
+
+            if obj["Key"].endswith("current.json"):
+                files.append(obj["Key"])
+
+    return files
+
+def get_stablecoin_files():
+
+    paginator = s3.get_paginator("list_objects_v2")
+
+    files = []
+
+    for page in paginator.paginate(
+        Bucket=PROCESSED_BUCKET,
+        Prefix="stablecoins/stablecoins_current/"
+    ):
+
+        for obj in page.get("Contents", []):
+
+            if obj["Key"].endswith("current.json"):
+                files.append(obj["Key"])
+
+    return files
+
+def save_json(bucket, key, payload):
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload),
+        ContentType="application/json"
+    )
+
+def process_protocols(ingestion_date):
+
+    results = []
+
+    files = get_protocol_files()
+
+    for key in files:
+
+        response = s3.get_object(
+            Bucket=PROCESSED_BUCKET,
+            Key=key
+        )
+
+        record = json.loads(
+            response["Body"].read()
+        )
+
+        risk = score_protocol(record)
+
+        output = {
+
+            "asset_type": "protocol",
+
+            "slug": record.get("slug"),
+
+            "protocol_name":
+                record.get(
+                    "protocol_name"
+                ),
+
+            **risk,
+
+            "ingestion_date":
+                ingestion_date
+        }
+
+        slug = record.get("slug")
+
+        risk_key = (
+            f"risk/risk_scores_current/"
+            f"asset_type=protocol/"
+            f"slug={slug}/"
+            f"risk.json"
+        )
+
+        save_json(
+            PROCESSED_BUCKET,
+            risk_key,
+            output
+        )
+
+        results.append(output)
+
+    return results
+
+def process_stablecoins(ingestion_date):
+
+    results = []
+
+    files = get_stablecoin_files()
+
+    for key in files:
+
+        response = s3.get_object(
+            Bucket=PROCESSED_BUCKET,
+            Key=key
+        )
+
+        record = json.loads(
+            response["Body"].read()
+        )
+
+        risk = score_stablecoin(record)
+
+        output = {
+
+            "asset_type": "stablecoin",
+
+            "symbol":
+                record.get(
+                    "symbol"
+                ),
+
+            "stablecoin_name":
+                record.get(
+                    "stablecoin_name"
+                ),
+
+            **risk,
+
+            "ingestion_date":
+                ingestion_date
+        }
+
+        symbol = record.get("symbol")
+
+        risk_key = (
+            f"risk/risk_scores_current/"
+            f"asset_type=stablecoin/"
+            f"symbol={symbol}/"
+            f"risk.json"
+        )
+
+        save_json(
+            PROCESSED_BUCKET,
+            risk_key,
+            output
+        )
+
+        results.append(output)
+
+    return results
+
+def lambda_handler(event, context):
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    ingestion_date = now.strftime(
+        "%Y-%m-%d"
+    )
+
+    protocol_results = (
+        process_protocols(
+            ingestion_date
+        )
+    )
+
+    stablecoin_results = (
+        process_stablecoins(
+            ingestion_date
+        )
+    )
+
+    return {
+
+        "statusCode": 200,
+
+        "protocols_processed":
+            len(protocol_results),
+
+        "stablecoins_processed":
+            len(stablecoin_results)
+    }
